@@ -111,6 +111,10 @@ func (t *Task) contextValue(key any, isTaskGoroutine bool) any {
 		return func(sig linux.Signal) error {
 			return t.SendSignal(SignalInfoNoInfo(sig, t, t))
 		}
+	case pgalloc.CtxMemoryCgroupID:
+		t.mu.Lock()
+		defer t.mu.Unlock()
+		return t.memCgID
 	case pgalloc.CtxMemoryFile:
 		return t.k.mf
 	case pgalloc.CtxMemoryFileProvider:
