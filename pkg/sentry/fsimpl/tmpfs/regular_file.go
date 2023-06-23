@@ -27,6 +27,7 @@ import (
 	"gvisor.dev/gvisor/pkg/safemem"
 	"gvisor.dev/gvisor/pkg/sentry/fsmetric"
 	"gvisor.dev/gvisor/pkg/sentry/fsutil"
+	"gvisor.dev/gvisor/pkg/sentry/hostfd"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
@@ -694,15 +695,7 @@ func (rw *regularFileReadWriter) WriteFromBlocks(srcs safemem.BlockSeq) (uint64,
 		mr := memmap.MappableRange{uint64(rw.off), uint64(end)}
 		switch {
 		case seg.Ok():
-			// Get internal mappings.
-			ims, err := rw.file.inode.fs.mf.MapInternal(seg.FileRangeOf(seg.Range().Intersect(mr)), hostarch.Write)
-			if err != nil {
-				retErr = err
-				goto exitLoop
-			}
-
-			// Copy to internal mappings.
-			n, err := safemem.CopySeq(ims, srcs)
+			n, err := rw.writeToMF(seg.FileRangeOf(seg.Range().Intersect(mr)), srcs)
 			done += n
 			rw.off += uint64(n)
 			srcs = srcs.DropFirst64(n)
@@ -728,7 +721,10 @@ func (rw *regularFileReadWriter) WriteFromBlocks(srcs safemem.BlockSeq) (uint64,
 				goto exitLoop
 			}
 			gapMR.End = gapMR.Start + (hostarch.PageSize * pagesReserved)
-			fr, err := rw.file.inode.fs.mf.Allocate(gapMR.Length(), pgalloc.AllocOpts{Kind: rw.file.memoryUsageKind})
+			fr, err := rw.file.inode.fs.mf.AllocateAndFill(gapMR.Length(), rw.file.memoryUsageKind, pgalloc.AllocateAndWritePopulate, safemem.ReaderFunc(func(dsts safemem.BlockSeq) (uint64, error) {
+				// No-op here. The write to dsts will happen in the next iteration.
+				return dsts.NumBytes(), nil
+			}))
 			if err != nil {
 				retErr = err
 				rw.file.inode.fs.unaccountPages(pagesReserved)
@@ -749,6 +745,25 @@ exitLoop:
 	}
 
 	return done, retErr
+}
+
+func (rw *regularFileReadWriter) writeToMF(fr memmap.FileRange, srcs safemem.BlockSeq) (uint64, error) {
+	if rw.file.inode.fs.mf.IsDiskBacked() {
+		return hostfd.Pwritev2(
+			int32(rw.file.inode.fs.mf.FD()), // fd
+			srcs.TakeFirst64(fr.Length()),   // srcs
+			int64(fr.Start),                 // offset
+			0,                               // flags
+		)
+	}
+	// Get internal mappings.
+	ims, err := rw.file.inode.fs.mf.MapInternal(fr, hostarch.Write)
+	if err != nil {
+		return 0, err
+	}
+
+	// Copy to internal mappings.
+	return safemem.CopySeq(ims, srcs)
 }
 
 // GetSeals returns the current set of seals on a memfd inode.
