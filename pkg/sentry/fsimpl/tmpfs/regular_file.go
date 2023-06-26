@@ -27,6 +27,7 @@ import (
 	"gvisor.dev/gvisor/pkg/safemem"
 	"gvisor.dev/gvisor/pkg/sentry/fsmetric"
 	"gvisor.dev/gvisor/pkg/sentry/fsutil"
+	"gvisor.dev/gvisor/pkg/sentry/hostfd"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
@@ -307,10 +308,7 @@ func (rf *regularFile) Translate(ctx context.Context, required, optional memmap.
 		}
 		optional = required
 	}
-	pagesAlloced, cerr := rf.data.Fill(ctx, required, optional, rf.size.RacyLoad(), rf.inode.fs.mf, rf.memoryUsageKind, pgalloc.AllocateOnly, func(_ context.Context, dsts safemem.BlockSeq, _ uint64) (uint64, error) {
-		// Newly-allocated pages are zeroed, so we don't need to do anything.
-		return dsts.NumBytes(), nil
-	})
+	pagesAlloced, cerr := rf.data.Fill(ctx, required, optional, rf.size.RacyLoad(), rf.inode.fs.mf, rf.memoryUsageKind, pgalloc.AllocateOnly, nil /* r */)
 	// rf.data.Fill() may fail mid-way. We still want to account any pages that
 	// were allocated, irrespective of an error.
 	rf.inode.fs.adjustPageAcct(pagesToFill, pagesAlloced)
@@ -387,10 +385,17 @@ func (fd *regularFileFD) Allocate(ctx context.Context, mode, offset, length uint
 	}
 	// Given our definitions in pgalloc, fallocate(2) semantics imply that pages
 	// in the MemoryFile must be committed, in addition to being allocated.
-	pagesAlloced, err := f.data.Fill(ctx, required, required, newSize, f.inode.fs.mf, f.memoryUsageKind, pgalloc.AllocateAndCommit, func(_ context.Context, dsts safemem.BlockSeq, _ uint64) (uint64, error) {
-		// Newly-allocated pages are zeroed, so we don't need to do anything.
-		return dsts.NumBytes(), nil
-	})
+	allocMode := pgalloc.AllocateAndCommit
+	if f.inode.fs.mf.IsDiskBacked() {
+		// Upgrade to AllocateAndWritePopulate for memory(shmem)-backed files. We
+		// take a more aggressive approach in populating pages for memory-backed
+		// MemoryFiles. shmem pages are subject to swap rather than disk writeback.
+		// They are not likely to be swapped before they are written to. Hence it
+		// is beneficial to populate (in addition to commit) shmem pages to avoid
+		// faulting page-by-page when these pages are written to in the future.
+		allocMode = pgalloc.AllocateAndWritePopulate
+	}
+	pagesAlloced, err := f.data.Fill(ctx, required, required, newSize, f.inode.fs.mf, f.memoryUsageKind, allocMode, nil /* r */)
 	// f.data.Fill() may fail mid-way. We still want to account any pages that
 	// were allocated, irrespective of an error.
 	f.inode.fs.adjustPageAcct(pagesToFill, pagesAlloced)
@@ -694,15 +699,7 @@ func (rw *regularFileReadWriter) WriteFromBlocks(srcs safemem.BlockSeq) (uint64,
 		mr := memmap.MappableRange{uint64(rw.off), uint64(end)}
 		switch {
 		case seg.Ok():
-			// Get internal mappings.
-			ims, err := rw.file.inode.fs.mf.MapInternal(seg.FileRangeOf(seg.Range().Intersect(mr)), hostarch.Write)
-			if err != nil {
-				retErr = err
-				goto exitLoop
-			}
-
-			// Copy to internal mappings.
-			n, err := safemem.CopySeq(ims, srcs)
+			n, err := rw.writeToMF(seg.FileRangeOf(seg.Range().Intersect(mr)), srcs)
 			done += n
 			rw.off += uint64(n)
 			srcs = srcs.DropFirst64(n)
@@ -728,7 +725,21 @@ func (rw *regularFileReadWriter) WriteFromBlocks(srcs safemem.BlockSeq) (uint64,
 				goto exitLoop
 			}
 			gapMR.End = gapMR.Start + (hostarch.PageSize * pagesReserved)
-			fr, err := rw.file.inode.fs.mf.Allocate(gapMR.Length(), pgalloc.AllocOpts{Kind: rw.file.memoryUsageKind})
+			var (
+				fr  memmap.FileRange
+				err error
+			)
+			if rw.file.inode.fs.mf.IsDiskBacked() {
+				// Don't populate pages for disk-backed files. Benchmarking showed that
+				// prepopulated pages are likely to be written back to disk before
+				// rw.writeToMF() can write to them. The pages fault again on write
+				// anyways. In total, prepopulating disk-backed pages deteriorates
+				// performance as it fails to eliminate future page faults  and we also
+				// additionally incur useless disk writebacks.
+				fr, err = rw.file.inode.fs.mf.Allocate(gapMR.Length(), pgalloc.AllocOpts{Kind: rw.file.memoryUsageKind})
+			} else {
+				fr, err = rw.file.inode.fs.mf.AllocateAndFill(gapMR.Length(), rw.file.memoryUsageKind, pgalloc.AllocateAndWritePopulate, nil /* r */)
+			}
 			if err != nil {
 				retErr = err
 				rw.file.inode.fs.unaccountPages(pagesReserved)
@@ -749,6 +760,29 @@ exitLoop:
 	}
 
 	return done, retErr
+}
+
+func (rw *regularFileReadWriter) writeToMF(fr memmap.FileRange, srcs safemem.BlockSeq) (uint64, error) {
+	if rw.file.inode.fs.mf.IsDiskBacked() {
+		// Disk-backed files are not prepopulated. The safemem.CopySeq() approach
+		// used below incurs a lot of page faults without page prepopulation, which
+		// causes a lot of context switching. Use write(2) host syscall instead,
+		// which makes one context switch and faults all the pages that are touched
+		// during the write.
+		return hostfd.Pwritev2(
+			int32(rw.file.inode.fs.mf.FD()), // fd
+			srcs.TakeFirst64(fr.Length()),   // srcs
+			int64(fr.Start),                 // offset
+			0,                               // flags
+		)
+	}
+	// Get internal mappings.
+	ims, err := rw.file.inode.fs.mf.MapInternal(fr, hostarch.Write)
+	if err != nil {
+		return 0, err
+	}
+	// Copy to internal mappings.
+	return safemem.CopySeq(ims, srcs)
 }
 
 // GetSeals returns the current set of seals on a memfd inode.

@@ -609,32 +609,22 @@ const (
 	AllocateAndWritePopulate
 )
 
-// AllocateAndFill allocates memory of the given kind and fills it by calling
-// r.ReadToBlocks() repeatedly until either length bytes are read or a non-nil
-// error is returned. It returns the memory filled by r, truncated down to the
-// nearest page. If this is shorter than length bytes due to an error returned
-// by r.ReadToBlocks(), it returns that error.
+// AllocateAndFill allocates memory of the given kind. If r is provided, the
+// memory is filled by calling r.ReadToBlocks() repeatedly until either length
+// bytes are read or a non-nil error is returned. It returns the allocated
+// memory, truncated down to the nearest page. If this is shorter than length
+// bytes due to an error returned by r.ReadToBlocks(), it returns that error.
 //
 // allocMode allows the callers to select how the pages are allocated in the
 // MemoryFile. Callers that will fill the allocated memory by writing to it
 // should pass AllocateAndWritePopulate to avoid faulting page-by-page. Callers
 // that will fill the allocated memory by invoking host system calls should
-// pass AllocateOnly. Note that the mode may be upgraded in certain scenarios
-// for performance. See implementation for more details.
+// pass AllocateOnly.
 //
 // Preconditions:
 //   - length > 0.
 //   - length must be page-aligned.
 func (f *MemoryFile) AllocateAndFill(length uint64, kind usage.MemoryKind, allocMode AllocationMode, r safemem.Reader) (memmap.FileRange, error) {
-	if !f.opts.DiskBackedFile && allocMode == AllocateAndCommit {
-		// Upgrade to AllocateAndWritePopulate for memory(shmem)-backed files. We
-		// take a more aggressive approach in populating pages for memory-backed
-		// MemoryFiles. shmem pages are subject to swap rather than disk writeback.
-		// They are not likely to be swapped before they are written to. Hence it
-		// is beneficial to populate (in addition to commit) shmem pages to avoid
-		// faulting page-by-page when these pages are written to in the future.
-		allocMode = AllocateAndWritePopulate
-	}
 	fr, err := f.Allocate(length, AllocOpts{Kind: kind})
 	if err != nil {
 		return memmap.FileRange{}, err
@@ -645,6 +635,10 @@ func (f *MemoryFile) AllocateAndFill(length uint64, kind usage.MemoryKind, alloc
 			return memmap.FileRange{}, err
 		}
 	}
+	if r == nil && allocMode != AllocateAndWritePopulate {
+		// Short circuit to avoid unnecessary call to MapInternal().
+		return fr, nil
+	}
 	dsts, err := f.MapInternal(fr, hostarch.Write)
 	if err != nil {
 		f.DecRef(fr)
@@ -653,7 +647,7 @@ func (f *MemoryFile) AllocateAndFill(length uint64, kind usage.MemoryKind, alloc
 	if allocMode == AllocateAndWritePopulate && canPopulate() {
 		rem := dsts
 		for {
-			if !f.tryPopulate(rem.Head()) {
+			if !tryPopulate(rem.Head()) {
 				break
 			}
 			rem = rem.Tail()
@@ -661,6 +655,9 @@ func (f *MemoryFile) AllocateAndFill(length uint64, kind usage.MemoryKind, alloc
 				break
 			}
 		}
+	}
+	if r == nil {
+		return fr, nil
 	}
 	n, err := safemem.ReadFullToBlocks(r, dsts)
 	un := uint64(hostarch.Addr(n).RoundDown())
@@ -674,14 +671,40 @@ func (f *MemoryFile) AllocateAndFill(length uint64, kind usage.MemoryKind, alloc
 }
 
 var mlockDisabled atomicbitops.Uint32
+var madvPopulateWriteDisabled atomicbitops.Uint32
 
 func canPopulate() bool {
-	return mlockDisabled.Load() == 0
+	return mlockDisabled.Load() == 0 || madvPopulateWriteDisabled.Load() == 0
 }
 
-func (f *MemoryFile) tryPopulate(b safemem.Block) bool {
-	// For disk-backed MemoryFiles, mlock+munlock will populate pages read-only.
-	if mlockDisabled.Load() != 0 || f.opts.DiskBackedFile {
+func tryPopulateMadv(b safemem.Block) bool {
+	if madvPopulateWriteDisabled.Load() != 0 {
+		return false
+	}
+	start, ok := hostarch.Addr(b.Addr()).RoundUp()
+	if !ok {
+		return true
+	}
+	end := hostarch.Addr(b.Addr() + uintptr(b.Len())).RoundDown()
+	if start >= end {
+		return true
+	}
+	_, _, errno := unix.RawSyscall(unix.SYS_MADVISE, uintptr(start), uintptr(end-start), unix.MADV_POPULATE_WRITE)
+	if errno != 0 {
+		if errno == unix.EINVAL {
+			// EINVAL is expected if MADV_POPULATE_WRITE is not supported (Linux <5.14).
+			log.Infof("Disabling pgalloc.MemoryFile.AllocateAndFill pre-population: madvise failed: %s", errno)
+		} else {
+			log.Warningf("Disabling pgalloc.MemoryFile.AllocateAndFill pre-population: madvise failed: %s", errno)
+		}
+		madvPopulateWriteDisabled.Store(1)
+		return false
+	}
+	return true
+}
+
+func tryPopulateMlock(b safemem.Block) bool {
+	if mlockDisabled.Load() != 0 {
 		return false
 	}
 	// Call mlock to populate pages, then munlock to cancel the mlock (but keep
@@ -712,6 +735,31 @@ func (f *MemoryFile) tryPopulate(b safemem.Block) bool {
 		return false
 	}
 	return true
+}
+
+func tryPopulate(b safemem.Block) bool {
+	// There are two approaches for populating writable pages:
+	// 1. madvise(MADV_POPULATE_WRITE). It has the desired effect: "Populate
+	//    (prefault) page tables writable, faulting in all pages in the range
+	//    just as if manually writing to each each page".
+	// 2. Call mlock to populate pages, then munlock to cancel the mlock (but
+	//    keep the pages populated).
+	//
+	// Prefer the madvise(MADV_POPULATE_WRITE) approach because:
+	// - Only requires 1 syscall, as opposed to 2 syscalls with mlock approach.
+	// - It is faster because it doesn't have to modify vmas like mlock does.
+	// - It works for disk-backed memory mappings too. The mlock approach doesn't
+	//   work for disk-backed filesystems (e.g. ext4). This is because
+	//   mlock(2) => mm/gup.c:__mm_populate() emulates a read fault on writable
+	//   MAP_SHARED mappings. For memory-backed (shmem) files,
+	//   mm/mmap.c:vma_set_page_prot() => vma_wants_writenotify() is false, so
+	//   the page table entries populated by a read fault are writable. For
+	//   disk-backed files, vma_set_page_prot() => vma_wants_writenotify() is
+	//   true, so the page table entries populated by a read fault are read-only.
+	if tryPopulateMadv(b) {
+		return true
+	}
+	return tryPopulateMlock(b)
 }
 
 // fallocate(2) modes, defined in Linux's include/uapi/linux/falloc.h.
@@ -1222,6 +1270,11 @@ func (f *MemoryFile) File() *os.File {
 // FD implements memmap.File.FD.
 func (f *MemoryFile) FD() int {
 	return int(f.file.Fd())
+}
+
+// IsDiskBacked returns true if f is backed by a file on disk.
+func (f *MemoryFile) IsDiskBacked() bool {
+	return f.opts.DiskBackedFile
 }
 
 // String implements fmt.Stringer.String.
