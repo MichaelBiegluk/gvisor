@@ -697,14 +697,18 @@ func tryPopulateMadv(b safemem.Block) bool {
 		return true
 	}
 	end := hostarch.Addr(b.Addr() + uintptr(b.Len())).RoundDown()
-	bLen := end - start
+	size := uintptr(end - start)
 	// Only call madvise(MADV_POPULATE_WRITE) if >=2 pages are being populated.
 	// 1 syscall overhead >= 1 page fault overhead. This is because syscalls are
 	// susceptible to additional overheads like seccomp-bpf filters and auditing.
-	if start >= end || bLen <= hostarch.PageSize {
+	if start >= end || size <= hostarch.PageSize {
 		return true
 	}
-	_, _, errno := unix.RawSyscall(unix.SYS_MADVISE, uintptr(start), uintptr(bLen), unix.MADV_POPULATE_WRITE)
+	// Limit to 1 GB (chunkSize).
+	if size > chunkSize {
+		size = chunkSize
+	}
+	_, _, errno := unix.RawSyscall(unix.SYS_MADVISE, uintptr(start), size, unix.MADV_POPULATE_WRITE)
 	if errno != 0 {
 		if errno == unix.EINVAL {
 			// EINVAL is expected if MADV_POPULATE_WRITE is not supported (Linux <5.14).
@@ -736,8 +740,13 @@ func tryPopulateMlock(b safemem.Block) bool {
 	if start >= end {
 		return true
 	}
-	_, _, errno := unix.Syscall(unix.SYS_MLOCK, uintptr(start), uintptr(end-start), 0)
-	unix.RawSyscall(unix.SYS_MUNLOCK, uintptr(start), uintptr(end-start), 0)
+	size := uintptr(end - start)
+	// Limit to 1 GB (chunkSize).
+	if size > chunkSize {
+		size = chunkSize
+	}
+	_, _, errno := unix.Syscall(unix.SYS_MLOCK, uintptr(start), size, 0)
+	unix.RawSyscall(unix.SYS_MUNLOCK, uintptr(start), size, 0)
 	if errno != 0 {
 		if errno == unix.ENOMEM || errno == unix.EPERM {
 			// These errors are expected from hitting non-zero RLIMIT_MEMLOCK, or
